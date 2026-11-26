@@ -1,6 +1,5 @@
 name: monitor
 on:
-  push:
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
@@ -19,6 +18,8 @@ jobs:
     timeout-minutes: 9
     steps:
       - uses: actions/checkout@v4
+      - name: Install image libs
+        run: pip install -q pillow numpy
       - name: Run monitor
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
