@@ -44,9 +44,10 @@ def fetch(url, tries=3):
 # ---------- parsing ----------
 class Anchors(HTMLParser):
     def __init__(s):
-        super().__init__(); s.out = []; s.cur = None
+        super().__init__(); s.out = []; s.cur = None; s.skip = 0
     def handle_starttag(s, t, a):
         a = dict(a)
+        if t in ("style", "script"): s.skip += 1
         if t == "a" and a.get("href"):
             s.cur = {"href": a["href"], "text": [], "img": None, "alt": None, "raw": []}
         if s.cur is not None:
@@ -56,8 +57,9 @@ class Anchors(HTMLParser):
             if src and not s.cur["img"]: s.cur["img"] = src
             s.cur["alt"] = s.cur["alt"] or a.get("alt")
     def handle_data(s, d):
-        if s.cur is not None and d.strip(): s.cur["text"].append(d.strip())
+        if s.cur is not None and not s.skip and d.strip(): s.cur["text"].append(d.strip())
     def handle_endtag(s, t):
+        if t in ("style", "script") and s.skip: s.skip -= 1
         if t == "a" and s.cur is not None:
             s.cur["text"] = " ".join(s.cur["text"]); s.cur["raw"] = " ".join(s.cur["raw"]); s.out.append(s.cur); s.cur = None
 
@@ -81,15 +83,16 @@ def parse_items(html, base=BASE + "/"):
         if not url: continue
         path = urllib.parse.urlsplit(url).path
         txt = a["text"] or a["alt"] or ""
-        if path == "/" or EXCLUDE.match(path) or txt.lower() in SEED_TEXT: continue
-        if not (a["img"] or PRICE.search(txt)): continue
+        if not path.startswith("/products/") or len(path) < 12: continue
         clean = re.sub(r"save\s*-\s*(?:R\s?[\d,]+|\d+\s*%)", "", txt, flags=re.I)  # drop "save - R12,000 / 49%"
         prices = [money(x) for x in PRICE.findall(clean)]
         sv = SAVE.search(txt)
         pct = int(sv.group(1)) if sv else None
         if pct is None and len(prices) > 1 and prices[1] > prices[0]: pct = round(100 * (prices[1] - prices[0]) / prices[1])
         steal = bool((pct or 0) >= MIN_STEAL_PCT or STEAL.search(txt) or STEAL.search(a["raw"]))
-        name = re.sub(r"(save\s*-\s*[\dR%,.]+|more options|R\s?\d[\d,\s]*)", "", STEAL.sub("", txt), flags=re.I).strip(" -") or a["alt"] or url
+        name = re.sub(r"(save\s*-\s*[\dR%,.]+|more options|R\s?\d[\d,\s]*)", "", STEAL.sub("", txt), flags=re.I).strip(" -")
+        if not name or re.search(r"[{};]", name) or name.lower() in ("best seller", "more options", "new"):
+            name = re.sub(r"-\d{6,}(?:-\d+)?$", "", path.rsplit("/", 1)[-1]).replace("-", " ").title()
         img = urllib.parse.urljoin(base, a["img"]) if a["img"] else None
         items.setdefault(product_id(url), {"url": url, "name": name[:150], "price": prices[0] if prices else None,
             "was": prices[1] if len(prices) > 1 else None, "pct": pct, "steal": steal, "image": img})
@@ -113,23 +116,9 @@ def robots_ok(fetcher):
     return lambda path: not any(path.startswith(r) for r in rules)
 
 def crawl(fetcher, delay=1.0):
-    """Today's Deals ONLY. Raises on ANY failure (never returns a partial/empty catalogue)."""
-    ok = robots_ok(fetcher)
-    _, anchors = parse_items(fetcher(BASE + "/"))
-    seeds = [norm(a["href"]) for a in anchors if a["text"].lower() == "today's deals" and norm(a["href"])]
-    if not seeds: raise RuntimeError("Today's Deals link not found on homepage")
-    queue, seen, items = [seeds[0]], set(), {}
-    while queue:
-        u = queue.pop(0)
-        if u in seen or not ok(urllib.parse.urlsplit(u).path): continue
-        seen.add(u); time.sleep(delay)
-        got, anc = parse_items(fetcher(u), u)
-        items.update({k: v for k, v in got.items() if k not in items})
-        for a in anc:  # pagination within Today's Deals
-            nu = norm(a["href"], u)
-            if nu and len(seen) < MAX_PAGES_PER_SEED and nu.split("?")[0] == u.split("?")[0] and nu not in seen and \
-               ("page=" in a["href"] or a["text"].lower() in ("next", "\u00bb", "\u203a")):
-                queue.append(nu)
+    """Today's Deals = the homepage (its 'Today's Deals' tab links to '/'). Raises on any failure."""
+    robots_ok(fetcher)
+    items, _ = parse_items(fetcher(BASE + "/"))
     if not items: raise RuntimeError("catalogue extraction returned 0 products")
     return items
 
@@ -161,6 +150,18 @@ def ntfy_send(topic, title, message, click=None, attach=None, tags=("shopping_ba
         except Exception: pass
         time.sleep(2 ** (i + 1))
     return False
+
+def enrich(it):
+    """Best-effort: read price from the product page's JSON-LD (only called for steals that will alert)."""
+    if it.get("price"): return it
+    try:
+        html = fetch(it["url"], 2)
+        for blk in re.findall(r'<script[^>]*application/ld\+json[^>]*>(.*?)</script>', html, re.S):
+            d = json.loads(blk); d = d[0] if isinstance(d, list) else d
+            off = d.get("offers") or {}; off = off[0] if isinstance(off, list) else off
+            if off.get("price"): it = dict(it, price=int(float(off["price"]))); break
+    except Exception: pass
+    return it
 
 def fmt(it):
     lines = ["Product: " + it["name"]]
@@ -260,7 +261,7 @@ def run(c, items, notify, now=None, rollover=False, img_check=None):
         if notify("🔄 ONEDAYONLY GRID REFRESHED", f"Today's Deals have changed: {len(new)} new products.\n\n{BASE}/", BASE + "/", None):
             meta_set(c, "last_swap", now); c.commit(); sent += 1
     for pid, data in c.execute("SELECT id,data FROM products WHERE notified=0 ORDER BY first_seen").fetchall():
-        it = json.loads(data)
+        it = enrich(json.loads(data))
         if not notify(f"🔥 STEAL: {it['pct']}% OFF" if it.get("pct") else "🔥 STEAL", fmt(it), it["url"], it.get("image")): break
         c.execute("UPDATE products SET notified=1 WHERE id=?", (pid,)); c.commit(); sent += 1
     left = c.execute("SELECT COUNT(*) FROM products WHERE notified=0").fetchone()[0]
@@ -296,6 +297,26 @@ def discover():
             if sc and (sc[0] >= 0.3 or sc[1] >= 20): print("  ", k, sc, v["image"])
         for k, v in list(items.items())[:3]: print("  sample image:", v.get("image"))
     except Exception as e: print("image scan unavailable:", e)
+    try:
+        m_ = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S); nd = json.loads(m_.group(1))
+        print("NEXT_DATA top keys:", list(nd)[:10], "| props keys:", list(nd.get("props", {}))[:10])
+        lists, hits = [], []
+        def walk(o, p):
+            if isinstance(o, dict):
+                for k, v in o.items():
+                    if re.search(r"steal|verified|badge|label|tag", k, re.I) and len(hits) < 12: hits.append((p + "/" + k, str(v)[:80]))
+                    walk(v, p + "/" + k)
+            elif isinstance(o, list):
+                if len(o) >= 20 and isinstance(o[0], dict): lists.append((p, len(o), o[0]))
+                for i, v in enumerate(o[:3]): walk(v, p + f"[{i}]")
+        walk(nd, "")
+        for p, n, first in lists[:6]: print("LIST", p, n, "keys:", list(first)[:40], "\n   first:", json.dumps(first)[:700])
+        for h in hits: print("FLAG-LIKE KEY", h)
+    except Exception as e: print("NEXT_DATA parse failed:", e)
+    try:
+        ph = fetch(list(items)[0] and list(items.values())[0]["url"], 1)
+        print("PRODUCT PAGE JSON-LD:", [b[:600] for b in re.findall(r'application/ld\+json[^>]*>(.*?)</script>', ph, re.S)][:2])
+    except Exception as e: print("product page fetch failed:", e)
     for path in ("/robots.txt", "/sitemap.xml"):
         try: print(path, "->", fetch(BASE + path, 1)[:600].replace("\n", " | "))
         except Exception as e: print(path, "unavailable:", e)
