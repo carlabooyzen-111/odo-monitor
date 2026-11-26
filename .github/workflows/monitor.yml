@@ -1,7 +1,7 @@
 name: monitor
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/10 * * * *"   # backup starter; the run also restarts itself
   workflow_dispatch:
     inputs:
       mode:
@@ -9,17 +9,21 @@ on:
         default: "run"
 permissions:
   contents: write
+  actions: write
 concurrency:
   group: monitor
   cancel-in-progress: false
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 9
+    timeout-minutes: 58
     steps:
       - uses: actions/checkout@v4
-      - name: Install image libs
-        run: pip install -q pillow numpy
+      - name: Setup
+        run: |
+          git config user.name monitor
+          git config user.email monitor@users.noreply.github.com
+          pip install -q pillow numpy
       - name: Run monitor
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
@@ -29,12 +33,15 @@ jobs:
             discover) python3 monitor.py --discover ;;
             test-notify) python3 monitor.py --test-notify ;;
             dry-run) python3 monitor.py --dry-run ;;
-            *) python3 monitor.py --loop 240 ;;
+            *) python3 monitor.py --loop 3000 ;;
           esac
       - name: Save state
         if: always()
         run: |
-          git config user.name monitor
-          git config user.email monitor@users.noreply.github.com
           [ -f monitor.db ] && git add monitor.db
           git diff --cached --quiet || (git commit -qm "state" && git pull --rebase -q && git push -q)
+      - name: Start next run (continuous monitoring)
+        if: always() && (inputs.mode == '' || inputs.mode == 'run')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run monitor.yml -f mode=run
