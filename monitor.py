@@ -19,6 +19,7 @@ EXCLUDE = re.compile(r"^/(about|blog|terms|privacy|help|contact|careers|account|
 STEAL = re.compile(os.environ.get("STEAL_PATTERN", r"verified[\s_-]*steal"), re.I)
 PRICE = re.compile(r"R\s?(\d[\d,\s]*)")
 SAVE = re.compile(r"save\s*-\s*(\d+)\s*%", re.I)
+POLL = int(os.environ.get("POLL_SECONDS", "30"))  # seconds between checks inside a run
 MIN_STEAL_PCT = int(os.environ.get("STEAL_MIN_PCT", "80"))  # steal = this % off or more
 MAX_PAGES_PER_SEED, MAX_SEEDS = 30, 40
 
@@ -321,6 +322,14 @@ def discover():
         try: print(path, "->", fetch(BASE + path, 1)[:600].replace("\n", " | "))
         except Exception as e: print(path, "unavailable:", e)
 
+def persist():
+    """Commit monitor.db to the repo right away (so a killed run never loses history -> no duplicate alerts)."""
+    if not os.environ.get("GITHUB_ACTIONS"): return
+    import subprocess
+    g = lambda *a: subprocess.run(a, capture_output=True, text=True)
+    if not g("git", "status", "--porcelain", DB).stdout.strip(): return
+    g("git", "add", DB); g("git", "commit", "-qm", "state"); g("git", "pull", "--rebase", "-q"); g("git", "push", "-q")
+
 def main():
     arg = sys.argv[1] if len(sys.argv) > 1 else ""
     topic = os.environ.get("NTFY_TOPIC", "")
@@ -346,8 +355,9 @@ def main():
             if n == 10 and arg != "--dry-run" and meta_get(c, "down_alert") != "1":
                 ntfy_send(topic, "\u26a0\ufe0f OneDayOnly monitor failing", f"10 failed checks in a row. Last error: {e}", tags=("warning",))
                 meta_set(c, "down_alert", "1"); c.commit()
-        if time.time() + 60 > end: break
-        time.sleep(60)
+        persist()
+        if time.time() + POLL > end: break
+        time.sleep(POLL)
     sys.exit(0 if ok else 1)
 
 if __name__ == "__main__": main()
